@@ -1,0 +1,416 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package benchmarks
+
+import (
+	"bytes"
+	"encoding/binary"
+	"fmt"
+	"math/big"
+	"math/rand"
+	"strconv"
+	"strings"
+	"testing"
+
+	decimal "github.com/0xCarbon/decimal"
+)
+
+var conversionVariants = []string{
+	"from-big-int19", "big-int19", "from-big-int40",
+	"from-rat-money", "rat-money", "from-rat-2dp",
+	"from-float64", "from-float64-exact", "float64-money",
+	"twos-complement16-in", "twos-complement16-out", "compose-money",
+	"int128-in", "int128-out",
+	"parse-to-exponent-2dp", "parse-with-context-d128",
+}
+
+var (
+	sinkBigInt  *big.Int
+	sinkBigRat  *big.Rat
+	sinkFloat64 float64
+	sinkBytes   []byte
+)
+
+// twosComplement128 is the oracle's 16-byte big-endian two's-complement
+// lane of v, built with math/big.
+func twosComplement128(v *big.Int) []byte {
+	u := new(big.Int).Set(v)
+	if u.Sign() < 0 {
+		u.Add(u, new(big.Int).Lsh(big.NewInt(1), 128))
+	}
+	return u.FillBytes(make([]byte, 16))
+}
+
+// conversionCorpora returns signed cent coefficients of 1 to 19 digits, rationals
+// a/b with a 12-digit numerator and a denominator up to 999 (2dp targets),
+// and literals with three or four fractional digits for ParseToExponent.
+func conversionCorpora() (cents, ratios, literals []string) {
+	r := rand.New(rand.NewSource(portfolioSeed))
+	for range 256 {
+		sign := ""
+		if r.Intn(2) == 0 {
+			sign = "-"
+		}
+		cents = append(cents, sign+randNonzeroDigits(r, 1+r.Intn(19)))
+		ratios = append(ratios, randNonzeroDigits(r, 12)+"/"+strconv.Itoa(1+r.Intn(999)))
+		literals = append(literals, randNonzeroDigits(r, 1+r.Intn(6))+"."+randDigits(r, 3+r.Intn(2)))
+	}
+	copy(literals, []string{"0.005", "0.015", "0.0050", "0.0051", "2.675", "1.0049"})
+	return cents, ratios, literals
+}
+
+// conversionRows builds the conversion family: math/big and
+// binary64 ingress and egress, coefficient interchange (two's-complement
+// lanes, decompose, Int128 words) and parse-to-target. Each row's oracle is
+// math/big, strconv or the input text.
+func conversionRows(tb testing.TB) []oracleRow {
+	int19 := portfolioF1Inputs["int19"]
+	money6 := portfolioF1Inputs["money6"]
+	big40 := portfolioF1Inputs["big40"]
+	centText, ratioText, literals := conversionCorpora()
+	bigOf := func(s string) *big.Int {
+		v, ok := new(big.Int).SetString(s, 10)
+		if !ok {
+			tb.Fatalf("big.Int(%q)", s)
+		}
+		return v
+	}
+	ratOf := func(s string) *big.Rat {
+		v, ok := new(big.Rat).SetString(s)
+		if !ok {
+			tb.Fatalf("big.Rat(%q)", s)
+		}
+		return v
+	}
+	parse := func(inputs []string) []decimal.Decimal {
+		values, err := parseAll(inputs)
+		if err != nil {
+			tb.Fatal(err)
+		}
+		return values
+	}
+
+	int19Big, big40Big := make([]*big.Int, 256), make([]*big.Int, 256)
+	moneyRat, ratios := make([]*big.Rat, 256), make([]*big.Rat, 256)
+	moneyFloat := make([]float64, 256)
+	cents := make([]*big.Int, 256)
+	lanes, magnitudes := make([][]byte, 256), make([][]byte, 256)
+	his, los := make([]int64, 256), make([]uint64, 256)
+	for i := range 256 {
+		int19Big[i] = bigOf(int19[i])
+		big40Big[i] = bigOf(strings.Replace(big40[i], ".", "", 1))
+		moneyRat[i] = ratOf(money6[i])
+		ratios[i] = ratOf(ratioText[i])
+		var err error
+		if moneyFloat[i], err = strconv.ParseFloat(money6[i], 64); err != nil {
+			tb.Fatal(err)
+		}
+		cents[i] = bigOf(centText[i])
+		lanes[i] = twosComplement128(cents[i])
+		magnitudes[i] = new(big.Int).Abs(cents[i]).Bytes()
+		his[i] = int64(binary.BigEndian.Uint64(lanes[i][:8]))
+		los[i] = binary.BigEndian.Uint64(lanes[i][8:])
+	}
+	int19Values, moneyValues := parse(int19), parse(money6)
+	centValues := make([]decimal.Decimal, 256)
+	for i, c := range centText {
+		centValues[i] = decimal.MustParse(c + "E-2")
+	}
+	d128 := decimal.Decimal128Context()
+	scratch := make([]byte, 0, 16)
+
+	// exactRat checks a result's value against a rational and, for FromRat
+	// and the float64 ingress, the largest exponent not above zero.
+	exactRat := func(got decimal.Decimal, want *big.Rat) error {
+		negative, coefficient, exponent, err := cohortOf(got)
+		if err != nil {
+			return err
+		}
+		if negative {
+			coefficient.Neg(coefficient)
+		}
+		value := new(big.Rat).SetInt(coefficient)
+		if exponent < 0 {
+			value.Quo(value, new(big.Rat).SetInt(pow10(int(-exponent))))
+		} else {
+			value.Mul(value, new(big.Rat).SetInt(pow10(int(exponent))))
+		}
+		if value.Cmp(want) != 0 {
+			return fmt.Errorf("got %s, oracle %s", got, want.RatString())
+		}
+		if exponent > 0 || exponent < 0 && new(big.Int).Rem(coefficient, bigTen).Sign() == 0 {
+			return fmt.Errorf("got %s, not at the largest exponent not above zero", got)
+		}
+		return nil
+	}
+	cohortCents := func(got decimal.Decimal, i int) error {
+		return sameCohort(got, cents[i].Sign() < 0, new(big.Int).Abs(cents[i]), -2)
+	}
+
+	return []oracleRow{
+		{
+			variant: "from-big-int19", size: 256,
+			check: func() error {
+				return eachEntry(256, func(i int) error {
+					got, err := decimal.FromBigInt(int19Big[i])
+					if err != nil {
+						return err
+					}
+					return sameCohort(got, false, int19Big[i], 0)
+				})
+			},
+			run: func(i int) (err error) { sinkDecimal, err = decimal.FromBigInt(int19Big[i]); return },
+		},
+		{
+			variant: "big-int19", size: 256,
+			check: func() error {
+				return eachEntry(256, func(i int) error {
+					got, err := int19Values[i].BigInt(nil)
+					if err != nil {
+						return err
+					}
+					if got.Cmp(int19Big[i]) != 0 {
+						return fmt.Errorf("got %s, want %s", got, int19[i])
+					}
+					return nil
+				})
+			},
+			run: func(i int) (err error) { sinkBigInt, err = int19Values[i].BigInt(nil); return },
+		},
+		{
+			variant: "from-big-int40", size: 256,
+			check: func() error {
+				return eachEntry(256, func(i int) error {
+					got, err := decimal.FromBigInt(big40Big[i])
+					if err != nil {
+						return err
+					}
+					return sameCohort(got, false, big40Big[i], 0)
+				})
+			},
+			run: func(i int) (err error) { sinkDecimal, err = decimal.FromBigInt(big40Big[i]); return },
+		},
+		{
+			variant: "from-rat-money", size: 256,
+			check: func() error {
+				return eachEntry(256, func(i int) error {
+					got, err := decimal.FromRat(moneyRat[i])
+					if err != nil {
+						return err
+					}
+					return exactRat(got, moneyRat[i])
+				})
+			},
+			run: func(i int) (err error) { sinkDecimal, err = decimal.FromRat(moneyRat[i]); return },
+		},
+		{
+			variant: "rat-money", size: 256,
+			check: func() error {
+				return eachEntry(256, func(i int) error {
+					got, err := moneyValues[i].Rat(nil)
+					if err != nil {
+						return err
+					}
+					if got.Cmp(moneyRat[i]) != 0 {
+						return fmt.Errorf("got %s, want %s", got.RatString(), money6[i])
+					}
+					return nil
+				})
+			},
+			run: func(i int) (err error) { sinkBigRat, err = moneyValues[i].Rat(nil); return },
+		},
+		{
+			variant: "from-rat-2dp", size: 256,
+			check: func() error {
+				inexact := 0
+				err := eachEntry(256, func(i int) error {
+					got, c, err := decimal.FromRatToExponent(ratios[i], -2, decimal.TiesToEven)
+					if err != nil {
+						return err
+					}
+					scaled := new(big.Rat).Mul(ratios[i], big.NewRat(100, 1))
+					if !scaled.IsInt() {
+						inexact++
+					}
+					if got.String() != roundRatTiesToEven(ratios[i], 2) || got.Exponent() != -2 {
+						return fmt.Errorf("got %s, oracle %s", got, roundRatTiesToEven(ratios[i], 2))
+					}
+					return checkInexact(c, 0, !scaled.IsInt())
+				})
+				if err == nil && inexact < 128 {
+					err = fmt.Errorf("vacuous: only %d of 256 quotients round", inexact)
+				}
+				return err
+			},
+			run: func(i int) (err error) {
+				sinkDecimal, _, err = decimal.FromRatToExponent(ratios[i], -2, decimal.TiesToEven)
+				return
+			},
+		},
+		{
+			// The shortest round-trip digits are strconv's.
+			variant: "from-float64", size: 256,
+			check: func() error {
+				return eachEntry(256, func(i int) error {
+					got, err := decimal.FromFloat64(moneyFloat[i])
+					if err != nil {
+						return err
+					}
+					return exactRat(got, ratOf(strconv.FormatFloat(moneyFloat[i], 'f', -1, 64)))
+				})
+			},
+			run: func(i int) (err error) { sinkDecimal, err = decimal.FromFloat64(moneyFloat[i]); return },
+		},
+		{
+			variant: "from-float64-exact", size: 256,
+			check: func() error {
+				return eachEntry(256, func(i int) error {
+					got, err := decimal.FromFloat64Exact(moneyFloat[i])
+					if err != nil {
+						return err
+					}
+					return exactRat(got, new(big.Rat).SetFloat64(moneyFloat[i]))
+				})
+			},
+			run: func(i int) (err error) { sinkDecimal, err = decimal.FromFloat64Exact(moneyFloat[i]); return },
+		},
+		{
+			variant: "float64-money", size: 256,
+			check: func() error {
+				return eachEntry(256, func(i int) error {
+					got, c := moneyValues[i].Float64()
+					exact := new(big.Rat).SetFloat64(moneyFloat[i]).Cmp(moneyRat[i]) == 0
+					if got != moneyFloat[i] || (c&decimal.Inexact == 0) != exact {
+						return fmt.Errorf("got %v %v, strconv %v (exact %t)", got, c, moneyFloat[i], exact)
+					}
+					return nil
+				})
+			},
+			run: func(i int) error { sinkFloat64, _ = moneyValues[i].Float64(); return nil },
+		},
+		{
+			variant: "twos-complement16-in", size: 256,
+			check: func() error {
+				return eachEntry(256, func(i int) error {
+					got, err := decimal.NewTwosComplement(lanes[i], binary.BigEndian, -2)
+					if err != nil {
+						return err
+					}
+					return cohortCents(got, i)
+				})
+			},
+			run: func(i int) (err error) {
+				sinkDecimal, err = decimal.NewTwosComplement(lanes[i], binary.BigEndian, -2)
+				return
+			},
+		},
+		{
+			variant: "twos-complement16-out", size: 256,
+			check: func() error {
+				return eachEntry(256, func(i int) error {
+					got, err := centValues[i].AppendTwosComplement(nil, 16, binary.BigEndian)
+					if err != nil {
+						return err
+					}
+					if !bytes.Equal(got, lanes[i]) {
+						return fmt.Errorf("got %x, want %x", got, lanes[i])
+					}
+					return nil
+				})
+			},
+			run: func(i int) (err error) {
+				sinkBytes, err = centValues[i].AppendTwosComplement(scratch[:0], 16, binary.BigEndian)
+				return
+			},
+		},
+		{
+			variant: "compose-money", size: 256,
+			check: func() error {
+				return eachEntry(256, func(i int) error {
+					var got decimal.Decimal
+					if err := got.Compose(0, cents[i].Sign() < 0, magnitudes[i], -2); err != nil {
+						return err
+					}
+					return cohortCents(got, i)
+				})
+			},
+			run: func(i int) error { return sinkDecimal.Compose(0, cents[i].Sign() < 0, magnitudes[i], -2) },
+		},
+		{
+			variant: "int128-in", size: 256,
+			check: func() error {
+				return eachEntry(256, func(i int) error { return cohortCents(decimal.NewInt128(his[i], los[i], -2), i) })
+			},
+			run: func(i int) error { sinkDecimal = decimal.NewInt128(his[i], los[i], -2); return nil },
+		},
+		{
+			variant: "int128-out", size: 256,
+			check: func() error {
+				return eachEntry(256, func(i int) error {
+					hi, lo, ok := centValues[i].CoefficientInt128()
+					if !ok || hi != his[i] || lo != los[i] {
+						return fmt.Errorf("got %d:%d %t, want %d:%d", hi, lo, ok, his[i], los[i])
+					}
+					return nil
+				})
+			},
+			run: func(i int) error {
+				hi, lo, _ := centValues[i].CoefficientInt128()
+				sinkUint64 = uint64(hi) ^ lo
+				return nil
+			},
+		},
+		{
+			// CAST(text AS DECIMAL(p,2)): one half-even rounding at exponent −2.
+			variant: "parse-to-exponent-2dp", size: 256,
+			check: func() error {
+				return eachEntry(256, func(i int) error {
+					got, c, err := decimal.ParseToExponent(literals[i], -2, decimal.TiesToEven)
+					if err != nil {
+						return err
+					}
+					want := roundRatTiesToEven(ratOf(literals[i]), 2)
+					if got.String() != want || got.Exponent() != -2 {
+						return fmt.Errorf("got %s, oracle %s", got, want)
+					}
+					return checkInexact(c, 0, !new(big.Rat).Mul(ratOf(literals[i]), big.NewRat(100, 1)).IsInt())
+				})
+			},
+			run: func(i int) (err error) {
+				sinkDecimal, _, err = decimal.ParseToExponent(literals[i], -2, decimal.TiesToEven)
+				return
+			},
+		},
+		{
+			variant: "parse-with-context-d128", size: 256,
+			check: func() error {
+				return eachEntry(256, func(i int) error {
+					got, c, err := decimal.ParseWithContext(big40[i], d128)
+					if err != nil {
+						return err
+					}
+					q, cut, inexact := roundDigits(big40Big[i], 34, false)
+					if err := sameCohort(got, false, q, int64(cut-39)); err != nil {
+						return err
+					}
+					return checkInexact(c, cut, inexact)
+				})
+			},
+			run: func(i int) (err error) { sinkDecimal, _, err = decimal.ParseWithContext(big40[i], d128); return },
+		},
+	}
+}
+
+// TestConversionOracle checks every conversion row against its
+// independent oracle over the full committed-seed corpus, as the benchmark
+// does before timing.
+func TestConversionOracle(t *testing.T) {
+	testOracleRows(t, conversionRows(t), conversionVariants)
+}
+
+// BenchmarkConversion is the supplemental conversion family:
+// math/big and binary64 ingress and egress, coefficient interchange and
+// parse-to-target, reported apart from arithmetic.
+func BenchmarkConversion(b *testing.B) {
+	benchOracleRows(b, conversionRows(b))
+}

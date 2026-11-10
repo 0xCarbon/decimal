@@ -1,0 +1,124 @@
+-- Replacement coverage for the corpus families the finite-only value space
+-- excludes. These are original constructions, hand-derived from the library's
+-- documented semantics; NOT copied from the speleotrove distribution.
+-- Syntax: the decTest grammar, plus two extensions the executor documents: "rounding: exact" (the Exact
+-- mode) and the expectation "refused", meaning the operation fails and the
+-- listed conditions are the error's condition set.
+--
+-- One or more vectors per condition class that the finite-only value
+-- space turns into an error or a different result, and per excluded
+-- divergence family (clamped, signed zero, round-to-integral exponent,
+-- zero power). Division_impossible is covered with integer division;
+-- Insufficient_storage is a budget refusal with its own tests in the
+-- library, not a context directive.
+
+extended: 1
+precision: 9
+rounding: half_even
+maxexponent: 999
+minexponent: -999
+
+-- Conversion_syntax: malformed and non-finite text is refused.
+dec055r001 toSci '1..2'      -> refused Conversion_syntax
+dec055r002 toSci 'NaN'       -> refused Conversion_syntax
+dec055r003 toSci '-Infinity' -> refused Conversion_syntax
+dec055r004 toSci ''          -> refused Conversion_syntax
+
+-- Division_by_zero and Division_undefined: GDA's Infinity and NaN results
+-- become refusals (domain violations are never demoted).
+dec055r010 divide '1' '0'      -> refused Division_by_zero
+dec055r011 divide '-1.5' '0E+3' -> refused Division_by_zero
+dec055r012 divide '0' '0'      -> refused Division_undefined
+dec055r013 power '0' '-1'      -> refused Division_by_zero
+dec055r014 power '0E-3' '-2'   -> refused Division_by_zero
+
+-- Invalid_operation (Quantize beyond precision, Sqrt of a negative).
+dec055r020 squareroot '-1'     -> refused Invalid_operation
+dec055r021 squareroot '-0.01'  -> refused Invalid_operation
+dec055r022 quantize '123456789' '1E-1' -> refused Invalid_operation
+dec055r023 quantize '1' '1E-1010'      -> refused Invalid_operation
+dec055r024 tointegralx '1.23E+96'      -> refused Invalid_operation
+
+-- Rounding-refused class (the Exact mode): a value change
+-- is refused with Inexact; a zero-only discard and an exact result pass.
+rounding: exact
+dec055r030 add '1.00000000' '0.000000001' -> refused Inexact
+dec055r031 divide '1' '3'                 -> refused Inexact
+dec055r032 tointegralx '2.5'              -> refused Inexact
+dec055r033 quantize '1.2300' '1E-2'       -> 1.23 Rounded
+dec055r034 multiply '1.5' '2'             -> 3.0
+dec055r035 squareroot '2'                 -> refused Inexact
+rounding: half_even
+
+-- Invalid_context: a guard pair whose Etiny leaves int32, or Emin > Emax.
+maxexponent: 999
+minexponent: -2147483647
+dec055r040 add '1' '1' -> refused Invalid_context
+maxexponent: -1
+minexponent: 1
+dec055r041 add '1' '1' -> refused Invalid_context
+maxexponent: 999
+minexponent: -999
+
+-- Overflow: GDA returns Infinity in the nearest modes, in up, and in the
+-- directed mode away from the result's sign; guarded overflow substitutes
+-- the largest finite value in every mode. One vector
+-- per mode, both signs for the directed modes.
+precision: 3
+maxexponent: 2
+minexponent: -2
+dec055r050 add '999' '1'           -> 999 Inexact,Overflow,Rounded
+dec055r051 multiply '-999' '10'    -> -999 Inexact,Overflow,Rounded
+rounding: up
+dec055r052 add '999' '0.5'         -> 999 Inexact,Overflow,Rounded
+rounding: half_even
+dec055r053 tosci '1E+3'            -> 999 Inexact,Overflow,Rounded
+rounding: half_up
+dec055r054 add '999' '1'           -> 999 Inexact,Overflow,Rounded
+dec055r055 add '-999' '-1'         -> -999 Inexact,Overflow,Rounded
+rounding: half_down
+dec055r056 multiply '999' '10'     -> 999 Inexact,Overflow,Rounded
+rounding: down
+dec055r057 add '999' '1'           -> 999 Inexact,Overflow,Rounded
+dec055r058 add '-999' '-1'         -> -999 Inexact,Overflow,Rounded
+rounding: ceiling
+dec055r059 add '999' '1'           -> 999 Inexact,Overflow,Rounded
+dec055r060 add '-999' '-1'         -> -999 Inexact,Overflow,Rounded
+rounding: floor
+dec055r061 add '999' '1'           -> 999 Inexact,Overflow,Rounded
+dec055r062 add '-999' '-1'         -> -999 Inexact,Overflow,Rounded
+rounding: half_even
+
+-- Underflow and Subnormal at the Etiny quantum.
+dec055r063 add '0.00123' '0'       -> 0.0012 Inexact,Rounded,Subnormal,Underflow
+dec055r064 add '0.0012' '0'        -> 0.0012 Subnormal
+dec055r065 multiply '0.001' '0.001' -> 0.0000 Inexact,Rounded,Subnormal,Underflow
+
+-- Clamped is never emitted: a zero keeps its ideal exponent.
+precision: 16
+maxexponent: 384
+minexponent: -383
+dec055r070 add '0E-400' '0E-19'    -> 0E-400
+dec055r071 divide '0E-3' '1E+400'  -> 0E-403
+dec055r072 multiply '0E+384' '1E+10' -> 0E+394
+
+-- Signed zero: one unsigned zero.
+precision: 9
+maxexponent: 999
+minexponent: -999
+dec055r080 add '-0' '-0'           -> 0
+dec055r081 subtract '0' '0'        -> 0
+dec055r082 multiply '-1' '0.00'    -> 0.00
+dec055r083 max '-0' '0.0'          -> 0
+dec055r084 min '-0.0' '0'          -> 0.0
+
+-- RoundToIntegral publishes exponent 0.
+dec055r090 tointegralx '56267E+1'  -> 562670
+dec055r091 tointegralx '0E+3'      -> 0
+dec055r092 tointegral '2.5E+1'     -> 25
+
+-- Zero powers: 0^0 = 1, and 0^n keeps the exponent n*e.
+dec055r100 power '0' '0'           -> 1
+dec055r101 power '-0' '0'          -> 1
+dec055r102 power '0E-30' '3'       -> 0E-90
+dec055r103 power '0.0' '2'         -> 0.00

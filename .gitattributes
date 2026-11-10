@@ -1,0 +1,3 @@
+# Text is LF in every working tree, including Windows checkouts, so goldens
+# and corpora hold the same bytes on every platform.
+* text=auto eol=lf

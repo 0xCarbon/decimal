@@ -1,0 +1,183 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package benchmarks
+
+import (
+	"fmt"
+	"math/big"
+	randv2 "math/rand/v2"
+	"strings"
+	"testing"
+
+	decimal "github.com/0xCarbon/decimal"
+)
+
+// mulFamilyDigits returns n pseudo-random decimal digits with a nonzero
+// lead, derived from the portfolio seed so rows are stable across commits.
+func mulFamilyDigits(r *randv2.Rand, n int) string {
+	var sb strings.Builder
+	sb.WriteByte(byte('1' + r.IntN(9)))
+	for range n - 1 {
+		sb.WriteByte(byte('0' + r.IntN(10)))
+	}
+	return sb.String()
+}
+
+type mulFamilyRow struct {
+	name string
+	run  func() (decimal.Decimal, error)
+	// check compares one result with an independent math/big oracle.
+	check func(decimal.Decimal) error
+}
+
+// mulFamilyRows is the dedicated multiply family: public
+// Mul over square and unbalanced operands from 38 to 9,000 digits, and the
+// two other public producers of a schoolbook product, SqrtWithContext
+// (r² for the remainder) and RoundToMultiple (quotient × multiple).
+// MulWithContext multiplies through the context digit stream, not the
+// schoolbook kernel, so its row is a control.
+func mulFamilyRows() []mulFamilyRow {
+	r := randv2.New(randv2.NewPCG(20260918, 60))
+	bigOf := func(s string) *big.Int {
+		v, _ := new(big.Int).SetString(s, 10)
+		return v
+	}
+	exact := func(want *big.Int) func(decimal.Decimal) error {
+		return func(got decimal.Decimal) error {
+			text, err := got.Text(0)
+			if err != nil {
+				return err
+			}
+			if text != want.String() {
+				return fmt.Errorf("got %.40s…, want %.40s…", text, want.String())
+			}
+			return nil
+		}
+	}
+	var rows []mulFamilyRow
+	for _, shape := range [][2]int{{38, 18}, {38, 38}, {54, 54}, {81, 81}, {300, 300}, {1000, 1000}, {9000, 9000}, {1000, 38}, {1000, 18}} {
+		x, y := mulFamilyDigits(r, shape[0]), mulFamilyDigits(r, shape[1])
+		a, b := decimal.MustParse(x), decimal.MustParse(y)
+		rows = append(rows, mulFamilyRow{
+			name:  fmt.Sprintf("mul/%dx%d", shape[0], shape[1]),
+			run:   func() (decimal.Decimal, error) { return a.Mul(b) },
+			check: exact(new(big.Int).Mul(bigOf(x), bigOf(y))),
+		})
+	}
+
+	// SqrtWithContext at precision 300 of a 601-digit integer: the result
+	// c·10^e lies strictly within half an ulp of √x and has 300 digits.
+	sx := mulFamilyDigits(r, 601)
+	sqrtIn := decimal.MustParse(sx)
+	ctx300, err := decimal.NewContext(300, decimal.TiesToEven, nil, 0)
+	if err != nil {
+		panic(err)
+	}
+	rows = append(rows, mulFamilyRow{
+		name: "sqrt/601p300",
+		run: func() (decimal.Decimal, error) {
+			v, _, err := sqrtIn.SqrtWithContext(ctx300)
+			return v, err
+		},
+		check: func(got decimal.Decimal) error {
+			text, err := got.Text(0)
+			if err != nil {
+				return err
+			}
+			root, ok := new(big.Rat).SetString(text)
+			if !ok || got.CoefficientDigits() != 300 {
+				return fmt.Errorf("sqrt result %.40s… is not a 300-digit value", text)
+			}
+			// Half an ulp, 10^e/2, for e ≥ 0 here (√ of 601 digits has 301).
+			if got.Exponent() < 0 {
+				return fmt.Errorf("sqrt exponent %d, want at least 0", got.Exponent())
+			}
+			half := new(big.Rat).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(got.Exponent())), nil))
+			half.Quo(half, big.NewRat(2, 1))
+			lo, hi := new(big.Rat).Sub(root, half), new(big.Rat).Add(root, half)
+			x := new(big.Rat).SetInt(bigOf(sx))
+			if new(big.Rat).Mul(lo, lo).Cmp(x) >= 0 || new(big.Rat).Mul(hi, hi).Cmp(x) <= 0 {
+				return fmt.Errorf("sqrt result %.40s… is not within half an ulp", text)
+			}
+			return nil
+		},
+	})
+
+	// RoundToMultiple of a 300-digit integer to a 38-digit multiple: the
+	// quotient (about 30 limbs) times the multiple (5 limbs), TiesToEven.
+	dx, mx := mulFamilyDigits(r, 300), mulFamilyDigits(r, 38)
+	dv, mv := decimal.MustParse(dx), decimal.MustParse(mx)
+	q, rem := new(big.Int).QuoRem(bigOf(dx), bigOf(mx), new(big.Int))
+	switch c := new(big.Int).Lsh(rem, 1).Cmp(bigOf(mx)); {
+	case c > 0, c == 0 && q.Bit(0) == 1:
+		q.Add(q, big.NewInt(1))
+	}
+	rows = append(rows, mulFamilyRow{
+		name: "roundmultiple/300by38",
+		run: func() (decimal.Decimal, error) {
+			v, _, err := dv.RoundToMultiple(mv, decimal.TiesToEven)
+			return v, err
+		},
+		check: exact(new(big.Int).Mul(q, bigOf(mx))),
+	})
+
+	// Control: MulWithContext at precision 700 keeps the 600-digit product
+	// exact but computes it in the context stream.
+	cx, cy := mulFamilyDigits(r, 300), mulFamilyDigits(r, 300)
+	ca, cb := decimal.MustParse(cx), decimal.MustParse(cy)
+	ctx700, err := decimal.NewContext(700, decimal.TiesToEven, nil, 0)
+	if err != nil {
+		panic(err)
+	}
+	rows = append(rows, mulFamilyRow{
+		name: "mulcontext/300x300",
+		run: func() (decimal.Decimal, error) {
+			v, _, err := ca.MulWithContext(cb, ctx700)
+			return v, err
+		},
+		check: exact(new(big.Int).Mul(bigOf(cx), bigOf(cy))),
+	})
+	return rows
+}
+
+// TestMulFamilyOracle checks every multiply-family row against math/big
+// once in the plain suite, so a wrong kernel fails without benchmarks.
+func TestMulFamilyOracle(t *testing.T) {
+	rows := mulFamilyRows()
+	for _, row := range rows {
+		got, err := row.run()
+		if err != nil {
+			t.Fatalf("%s: %v", row.name, err)
+		}
+		if err := row.check(got); err != nil {
+			t.Fatalf("%s: %v", row.name, err)
+		}
+	}
+	if len(rows) != 12 {
+		t.Fatalf("vacuous: %d multiply-family rows", len(rows))
+	}
+}
+
+// BenchmarkMulFamily is the dedicated multiply family. Each row
+// is checked against math/big before it is timed.
+func BenchmarkMulFamily(b *testing.B) {
+	for _, row := range mulFamilyRows() {
+		b.Run(row.name, func(b *testing.B) {
+			got, err := row.run()
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := row.check(got); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				sinkDecimal, err = row.run()
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}

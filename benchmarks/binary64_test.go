@@ -1,0 +1,82 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package benchmarks
+
+import (
+	"math"
+	"math/big"
+	"strconv"
+	"strings"
+	"testing"
+
+	decimal "github.com/0xCarbon/decimal"
+)
+
+var binary64Sink float64
+
+// BenchmarkBinary64Egress measures Float64, Float64Rounded and
+// CompareFloat64 as the exponent moves and on the long
+// exact expansions of subnormal and normal doubles. Each value's Float64
+// is first checked against strconv.ParseFloat of its text, and each
+// comparison against math/big.
+func BenchmarkBinary64Egress(b *testing.B) {
+	exact := func(f float64) string {
+		d, err := decimal.FromFloat64Exact(f)
+		if err != nil {
+			b.Fatal(err)
+		}
+		return d.String()
+	}
+	cases := []struct{ name, text string }{
+		{"money", "12345.67"},
+		{"tenth", "0.1"},
+		{"digits18", "123456789012.345678"},
+		{"digits38e300neg", "1.234567890123456789012345678901234567E-300"},
+		{"subnormal-min", exact(math.SmallestNonzeroFloat64)},
+		{"subnormal-max", exact(math.Float64frombits(0x000fffffffffffff))},
+		{"normal-min", exact(0x1p-1022)},
+	}
+	for _, e := range []int{20, 0, -20, -50, -100, -200, -300} {
+		cases = append(cases, struct{ name, text string }{"exp" + strings.Replace(strconv.Itoa(e), "-", "neg", 1), "1234567E" + strconv.Itoa(e)})
+	}
+	for _, tc := range cases {
+		d := decimal.MustParse(tc.text)
+		want, err := strconv.ParseFloat(tc.text, 64)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if got, _ := d.Float64(); got != want {
+			b.Fatalf("%s: Float64 %v, strconv %v", tc.name, got, want)
+		}
+		exactValue, _ := new(big.Rat).SetString(tc.text)
+		wantCmp := exactValue.Cmp(new(big.Rat).SetFloat64(want))
+		// Toward zero is the nearest double, or the one below it when the
+		// nearest lies above the exact value.
+		towardZero := want
+		if wantCmp < 0 {
+			towardZero = math.Nextafter(want, 0)
+		}
+		if got, _, err := d.Float64Rounded(decimal.TowardZero); err != nil || got != towardZero {
+			b.Fatalf("%s: Float64Rounded(TowardZero) %v (%v), math/big %v", tc.name, got, err, towardZero)
+		}
+		if got, err := d.CompareFloat64(want); err != nil || got != wantCmp {
+			b.Fatalf("%s: CompareFloat64 %d (%v), math/big %d", tc.name, got, err, wantCmp)
+		}
+		b.Run("float64/"+tc.name, func(b *testing.B) {
+			for b.Loop() {
+				binary64Sink, _ = d.Float64()
+			}
+		})
+		b.Run("toward-zero/"+tc.name, func(b *testing.B) {
+			for b.Loop() {
+				binary64Sink, _, _ = d.Float64Rounded(decimal.TowardZero)
+			}
+		})
+		b.Run("compare/"+tc.name, func(b *testing.B) {
+			for b.Loop() {
+				c, _ := d.CompareFloat64(want)
+				binary64Sink = float64(c)
+			}
+		})
+	}
+}

@@ -1,0 +1,312 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CGO_ENABLED: "0"
+  GOTOOLCHAIN: local
+
+jobs:
+  # Every job below is a required status check, so none may be skipped as a
+  # whole: a skipped matrix job reports no check and would block the pull
+  # request. Instead each job always starts and, for a change that touches
+  # only Markdown files or LICENSE, skips its steps (on a Linux runner). Any
+  # doubt (an unknown base, an empty or failed diff, a failed changes job)
+  # runs everything.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: classify the changed files
+        id: classify
+        env:
+          # A pull request is checked out as its merge commit, whose first
+          # parent is the base branch.
+          BASE: ${{ github.event_name == 'pull_request' && 'HEAD^1' || github.event.before }}
+        run: |
+          docs_only=false
+          if files=$(git diff --name-only --no-renames "$BASE" HEAD --) && [ -n "$files" ]; then
+            docs_only=true
+            while IFS= read -r file; do
+              case "$file" in
+                *.md | LICENSE | */LICENSE) ;;
+                *) docs_only=false ;;
+              esac
+            done <<< "$files"
+          fi
+          printf '%s\n' "$files"
+          echo "docs_only=$docs_only" | tee -a "$GITHUB_OUTPUT"
+
+  lint:
+    name: lint
+    needs: changes
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SKIP: ${{ needs.changes.outputs.docs_only == 'true' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: env.SKIP != 'true'
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: env.SKIP != 'true'
+        with:
+          go-version: "1.27.x"
+          check-latest: true
+      - name: gofmt
+        if: env.SKIP != 'true'
+        run: make fmt-check
+      - name: go vet (both profiles)
+        if: env.SKIP != 'true'
+        run: make vet
+      - name: go vet (incumbent harness)
+        if: env.SKIP != 'true'
+        working-directory: benchmarks/incumbents
+        run: go vet ./...
+      - name: checkdeps
+        if: env.SKIP != 'true'
+        run: make checkdeps
+      - name: checkstate
+        if: env.SKIP != 'true'
+        run: make checkstate
+      - name: generated files are current
+        if: env.SKIP != 'true'
+        run: |
+          make generate
+          test -z "$(git status --porcelain)" || { git status --short; git diff; exit 1; }
+
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.profile }})
+    needs: changes
+    if: ${{ !cancelled() }}
+    runs-on: ${{ needs.changes.outputs.docs_only == 'true' && 'ubuntu-latest' || matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+        profile: [simd, scalar]
+    env:
+      # A documentation-only change still runs this suite once: it holds the
+      # tests that read README.md, ARCHITECTURE.md and docs/.
+      SKIP: ${{ needs.changes.outputs.docs_only == 'true' && !(matrix.os == 'ubuntu-latest' && matrix.profile == 'simd') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: env.SKIP != 'true'
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: env.SKIP != 'true'
+        with:
+          go-version: "1.27.x"
+          check-latest: true
+      - name: go test
+        if: env.SKIP != 'true'
+        shell: bash
+        run: |
+          if [ "${{ matrix.profile }}" = simd ]; then export GOEXPERIMENT=simd; else export GOEXPERIMENT=; fi
+          go test -count=1 -timeout 25m ./...
+
+  test-386:
+    name: test (linux/386, ${{ matrix.profile }})
+    needs: changes
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [simd, scalar]
+    env:
+      SKIP: ${{ needs.changes.outputs.docs_only == 'true' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: env.SKIP != 'true'
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: env.SKIP != 'true'
+        with:
+          go-version: "1.27.x"
+          check-latest: true
+      - name: go test
+        if: env.SKIP != 'true'
+        env:
+          GOARCH: "386"
+        run: |
+          if [ "${{ matrix.profile }}" = simd ]; then export GOEXPERIMENT=simd; else export GOEXPERIMENT=; fi
+          go test -count=1 -timeout 25m ./...
+
+  wasm:
+    name: test (js/wasm, ${{ matrix.profile }})
+    needs: changes
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [simd, scalar]
+    env:
+      SKIP: ${{ needs.changes.outputs.docs_only == 'true' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: env.SKIP != 'true'
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: env.SKIP != 'true'
+        with:
+          go-version: "1.27.x"
+          check-latest: true
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: env.SKIP != 'true'
+        with:
+          node-version: "24"
+      - name: go vet
+        if: env.SKIP != 'true'
+        env:
+          GOOS: js
+          GOARCH: wasm
+        run: |
+          if [ "${{ matrix.profile }}" = simd ]; then export GOEXPERIMENT=simd; else export GOEXPERIMENT=; fi
+          go vet ./...
+      # go test runs each test binary through lib/wasm/go_js_wasm_exec under
+      # Node. The runtime refuses an oversized environment, so the tests run
+      # with a minimal one. The tools that run go or pipes are host programs
+      # and are not tested under js/wasm.
+      - name: go test
+        if: env.SKIP != 'true'
+        run: |
+          if [ "${{ matrix.profile }}" = simd ]; then profile=simd; else profile=; fi
+          env -i PATH="$(go env GOROOT)/lib/wasm:$PATH" HOME="$HOME" \
+            GOCACHE="$(go env GOCACHE)" GOMODCACHE="$(go env GOMODCACHE)" \
+            GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=js GOARCH=wasm GOEXPERIMENT="$profile" \
+            go test -count=1 -timeout 40m . ./benchmarks ./tools/oracle
+
+  conformance:
+    name: decTest conformance (${{ matrix.profile }})
+    needs: changes
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [simd, scalar]
+    env:
+      SKIP: ${{ needs.changes.outputs.docs_only == 'true' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: env.SKIP != 'true'
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: env.SKIP != 'true'
+        with:
+          go-version: "1.27.x"
+          check-latest: true
+      - name: cache the decTest corpus
+        if: env.SKIP != 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/dectest
+          key: dectest-${{ hashFiles('testdata/dectest/downloads.txt') }}
+      - name: provision and run the corpus
+        if: env.SKIP != 'true'
+        run: |
+          if [ "${{ matrix.profile }}" = simd ]; then export GOEXPERIMENT=simd; else export GOEXPERIMENT=; fi
+          make conformance GOEXPERIMENT="$GOEXPERIMENT"
+
+  fuzz-smoke:
+    name: fuzz smoke
+    needs: changes
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SKIP: ${{ needs.changes.outputs.docs_only == 'true' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: env.SKIP != 'true'
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: env.SKIP != 'true'
+        with:
+          go-version: "1.27.x"
+          check-latest: true
+      - name: fuzz every target for 20 s
+        if: env.SKIP != 'true'
+        run: make fuzz-smoke FUZZ_TIME=20s
+      - name: keep a crasher
+        if: failure()
+        run: git status --short testdata/fuzz
+
+  oracle:
+    name: oracle (seed ${{ github.run_number }})
+    needs: changes
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SKIP: ${{ needs.changes.outputs.docs_only == 'true' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: env.SKIP != 'true'
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: env.SKIP != 'true'
+        with:
+          go-version: "1.27.x"
+          check-latest: true
+      # The fixed-seed differential runs in every go test; this job searches
+      # a fresh seed per run. Reproduce a failure with the printed seed.
+      - name: math/big differential and property laws on a new seed
+        if: env.SKIP != 'true'
+        run: go run ./tools/oracle -seed ${{ github.run_number }} -random 5000 -ties 2000 -laws 5000
+
+  incumbents:
+    name: incumbent harness
+    needs: changes
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SKIP: ${{ needs.changes.outputs.docs_only == 'true' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: env.SKIP != 'true'
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: env.SKIP != 'true'
+        with:
+          go-version: "1.27.x"
+          check-latest: true
+          cache-dependency-path: benchmarks/incumbents/go.sum
+      - name: accuracy preconditions and one iteration of every row
+        if: env.SKIP != 'true'
+        working-directory: benchmarks/incumbents
+        run: go test -count=1 -run . -bench . -benchtime 1x ./...

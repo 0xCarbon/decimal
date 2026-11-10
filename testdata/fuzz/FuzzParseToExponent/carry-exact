@@ -1,0 +1,4 @@
+go test fuzz v1
+string("99.996")
+int32(-2)
+byte('\x07')

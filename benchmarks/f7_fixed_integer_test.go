@@ -1,0 +1,88 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package benchmarks
+
+import (
+	"strconv"
+	"testing"
+
+	decimal "github.com/0xCarbon/decimal"
+)
+
+func TestF7FixedIntegerAccuracy(t *testing.T) {
+	signedGot, signedWant, unsignedGot, unsignedWant := f7FixedIntegerAccuracy(t)
+	if len(signedGot) != 256 || len(unsignedGot) != 256 {
+		t.Fatalf("F7 fixed integer checked %d signed and %d unsigned inputs, want 256 each", len(signedGot), len(unsignedGot))
+	}
+	requireMatchedAccuracy(t, "F7FixedInteger/int64", signedGot, signedWant)
+	requireMatchedAccuracy(t, "F7FixedInteger/uint64", unsignedGot, unsignedWant)
+}
+
+// f7FixedIntegerAccuracy checks every timed input against the standard
+// library's integer formatter before a benchmark may publish a timing row.
+func f7FixedIntegerAccuracy(tb testing.TB) (signedGot, signedWant, unsignedGot, unsignedWant []string) {
+	tb.Helper()
+	signed, unsigned := f1FixedIntegerInputs()
+	if got := f1FixedIntegerDigest(signed, unsigned); got != f1FixedIntegerCorpusSHA {
+		tb.Fatalf("F7 fixed integer source corpus drift: %s", got)
+	}
+	signedGot, signedWant = make([]string, len(signed)), make([]string, len(signed))
+	unsignedGot, unsignedWant = make([]string, len(unsigned)), make([]string, len(unsigned))
+	for i, value := range signed {
+		got, err := decimal.FromInt64(value).Int64()
+		if err != nil {
+			tb.Fatalf("F7 Int64 input %d: %v", i, err)
+		}
+		signedGot[i], signedWant[i] = strconv.FormatInt(got, 10), strconv.FormatInt(value, 10)
+	}
+	for i, value := range unsigned {
+		got, err := decimal.FromUint64(value).Uint64()
+		if err != nil {
+			tb.Fatalf("F7 Uint64 input %d: %v", i, err)
+		}
+		unsignedGot[i], unsignedWant[i] = strconv.FormatUint(got, 10), strconv.FormatUint(value, 10)
+	}
+	return
+}
+
+var sinkF7Signed int64
+var sinkF7Unsigned uint64
+var sinkF7Error error
+
+// BenchmarkF7FixedInteger is a supplemental, exact fixed-width reverse
+// conversion workload.
+func BenchmarkF7FixedInteger(b *testing.B) {
+	signedGot, signedWant, unsignedGot, unsignedWant := f7FixedIntegerAccuracy(b)
+	requireMatchedAccuracy(b, "F7FixedInteger/int64", signedGot, signedWant)
+	requireMatchedAccuracy(b, "F7FixedInteger/uint64", unsignedGot, unsignedWant)
+	signed, unsigned := f1FixedIntegerInputs()
+	signedValues, unsignedValues := make([]decimal.Decimal, 256), make([]decimal.Decimal, 256)
+	for i := range signedValues {
+		signedValues[i] = decimal.FromInt64(signed[i])
+		unsignedValues[i] = decimal.FromUint64(unsigned[i])
+	}
+	b.Run("decimal/int64", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		i := 0
+		for b.Loop() {
+			sinkF7Signed, sinkF7Error = signedValues[i].Int64()
+			i = (i + 1) & 255
+		}
+		if sinkF7Error != nil {
+			b.Fatal(sinkF7Error)
+		}
+	})
+	b.Run("decimal/uint64", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		i := 0
+		for b.Loop() {
+			sinkF7Unsigned, sinkF7Error = unsignedValues[i].Uint64()
+			i = (i + 1) & 255
+		}
+		if sinkF7Error != nil {
+			b.Fatal(sinkF7Error)
+		}
+	})
+}

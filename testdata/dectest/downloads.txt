@@ -1,0 +1,10 @@
+# The General Decimal Arithmetic testcases (decTest 2.44, 7 Apr 2009) by
+# Mike Cowlishaw, published at https://speleotrove.com/decimal/. The corpus
+# is not redistributed here: `make conformance` (go run ./tools/dectestconv
+# -provision) downloads these files into .cache/dectest and verifies each
+# one's size and SHA-256 against the lines below. Recorded 2026-09-18.
+#
+# dectest.zip holds the extended suites (144 files), dectest0.zip the
+# X3.274 subset suites (32 files).
+dectest.zip: 791733 bytes sha256=b70a224cd52e82b7a8150aedac5efa2d0cb3941696fd829bdbe674f9f65c3926
+dectest0.zip: 235727 bytes sha256=f74c6657ba2b934110ff4729c4394e5bd4c8848e7c82716f0f9016484a23a655

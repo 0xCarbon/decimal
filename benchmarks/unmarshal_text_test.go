@@ -1,0 +1,132 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package benchmarks
+
+import (
+	"fmt"
+	"math/big"
+	"strconv"
+	"strings"
+	"testing"
+
+	decimal "github.com/0xCarbon/decimal"
+)
+
+var unmarshalDigitSizes = []int{6, 19, 64, 128, 192, 255, 256, 257, 384, 511, 512, 513, 768, 1023, 1024, 1025, 2048, 4096, 1 << 16, 1 << 20}
+
+// unmarshalDigitsInput defines the literal independently of Decimal. Both
+// forms have the same coefficient; the point alone changes the exponent.
+func unmarshalDigitsInput(n int, fractional, negative bool) ([]byte, *big.Int, int32) {
+	digits := strings.Repeat("1234567890", n/10+1)[:n]
+	want, ok := new(big.Int).SetString(digits, 10)
+	if !ok {
+		panic("invalid benchmark digits")
+	}
+	literal, exponent := digits, int32(7)
+	if fractional {
+		literal = digits[:n/2] + "." + digits[n/2:]
+		exponent -= int32(n - n/2)
+	}
+	if negative {
+		literal = "-" + literal
+		want.Neg(want)
+	}
+	return []byte(literal + "E+7"), want, exponent
+}
+
+// BenchmarkUnmarshalTextDigits measures the public byte-input parser with a
+// full math/big coefficient, sign and cohort precondition. digitsN rows use
+// a fractional input; integerN rows show the cost of a single digit run
+// versus two runs. The 6- and 19-digit rows measure short literals that
+// the inline parse path admits. Setup is outside b.Loop.
+func BenchmarkUnmarshalTextDigits(b *testing.B) {
+	for _, fractional := range []bool{true, false} {
+		for _, n := range unmarshalDigitSizes {
+			prefix := "integer"
+			if fractional {
+				prefix = "digits"
+			}
+			b.Run(prefix+strconv.Itoa(n), func(b *testing.B) {
+				text, want, exponent := unmarshalDigitsInput(n, fractional, false)
+				var d decimal.Decimal
+				if err := d.UnmarshalText(text); err != nil {
+					b.Fatal(err)
+				}
+				if err := unmarshalDigitsCheck(d, want, exponent); err != nil {
+					b.Fatal(err)
+				}
+				b.ReportAllocs()
+				b.SetBytes(int64(len(text)))
+				for b.Loop() {
+					if err := d.UnmarshalText(text); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
+// unmarshalDigitsCheck compares the observed public text's entire signed
+// coefficient with independently generated math/big input. Text is only an
+// observation surface: no Decimal operation generates the expected answer.
+// Scientific text contains the same coefficient digits; plain leading zeros
+// do not affect big.Int. The stored exponent independently pins the cohort.
+func unmarshalDigitsCheck(d decimal.Decimal, want *big.Int, exponent int32) error {
+	digits := len(strings.TrimPrefix(want.String(), "-"))
+	if d.CoefficientDigits() != uint64(digits) || d.Exponent() != exponent {
+		return fmt.Errorf("parsed %d digits at exponent %d, want %d at %d", d.CoefficientDigits(), d.Exponent(), digits, exponent)
+	}
+	observed, err := d.Text(0)
+	if err != nil {
+		return err
+	}
+	mantissa, _, _ := strings.Cut(observed, "E")
+	coefficient, ok := new(big.Int).SetString(strings.ReplaceAll(mantissa, ".", ""), 10)
+	if !ok || coefficient.Cmp(want) != 0 {
+		return fmt.Errorf("parsed coefficient/sign differs from independent input")
+	}
+	return nil
+}
+
+// TestUnmarshalTextDigitsRejectsWrongResult pins the matched-accuracy
+// precondition: a same-length wrong coefficient or sign cannot
+// produce an apparently successful benchmark, even at the right exponent.
+func TestUnmarshalTextDigitsRejectsWrongResult(t *testing.T) {
+	want := big.NewInt(1234567)
+	if err := unmarshalDigitsCheck(decimal.New(1234567, -3), want, -3); err != nil {
+		t.Fatal(err)
+	}
+	for _, coefficient := range []int64{7654321, -1234567, 1234566} {
+		if err := unmarshalDigitsCheck(decimal.New(coefficient, -3), want, -3); err == nil {
+			t.Errorf("accepted wrong same-length coefficient %d", coefficient)
+		}
+	}
+	if err := unmarshalDigitsCheck(decimal.New(1234567, -2), want, -3); err == nil {
+		t.Error("accepted wrong exponent")
+	}
+}
+
+// TestUnmarshalTextDigitsOracle checks that every benchmark input and its negative twin match a math/big coefficient and
+// hand-derived cohort before any timing is accepted.
+func TestUnmarshalTextDigitsOracle(t *testing.T) {
+	count := 0
+	for _, fractional := range []bool{true, false} {
+		for _, n := range unmarshalDigitSizes {
+			for _, negative := range []bool{false, true} {
+				text, want, exponent := unmarshalDigitsInput(n, fractional, negative)
+				var d decimal.Decimal
+				if err := d.UnmarshalText(text); err != nil {
+					t.Fatal(err)
+				}
+				if err := unmarshalDigitsCheck(d, want, exponent); err != nil {
+					t.Fatalf("n%d fractional%v negative%v: %v", n, fractional, negative, err)
+				}
+				count++
+			}
+		}
+	}
+	if count != 80 {
+		t.Fatalf("ran %d cases, want80", count)
+	}
+}

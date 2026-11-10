@@ -1,0 +1,2 @@
+go test fuzz v1
+string("123456789.987654321")

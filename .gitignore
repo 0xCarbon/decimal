@@ -1,0 +1,19 @@
+# Build output
+/bin/
+/dist/
+
+# Downloaded material (the decTest corpus); never committed
+/.cache/
+
+# Test, coverage and benchmark artifacts
+*.test
+*.out
+*.prof
+coverage.txt
+coverage.html
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+.DS_Store

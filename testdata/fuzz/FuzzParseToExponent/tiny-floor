@@ -1,0 +1,4 @@
+go test fuzz v1
+string("-1e-99999999999")
+int32(-2)
+byte('\x06')

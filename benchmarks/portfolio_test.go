@@ -1,0 +1,346 @@
+// SPDX-License-Identifier: Apache-2.0
+
+// Benchmark portfolio for the F1–F8 families.
+//
+// Every family's inputs are generated deterministically at init from the
+// committed seed 20260918 with the timer reset after setup; sub-benchmark
+// names are stable in Family/library/variant form so benchstat keys never
+// churn; every benchmark reports allocations; conversion (F1/F4) and
+// arithmetic (F2/F3/F6) families are reported separately, never merged.
+//
+// Incumbent libraries never enter this module: the comparison harness is the
+// separate module in benchmarks/incumbents.
+package benchmarks
+
+import (
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"math/rand"
+	"os"
+	"path/filepath"
+	"reflect"
+	"regexp"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+// portfolioSeed is the committed input seed.
+const portfolioSeed = 20260918
+
+// newPortfolioRNG returns a fresh deterministic source rooted at the
+// committed seed; calling it twice yields identical sequences.
+func newPortfolioRNG() *rand.Rand {
+	return rand.New(rand.NewSource(portfolioSeed))
+}
+
+// portfolioFamilyVariants is the fixed name table (names key
+// identically on two commits because inputs derive from the committed seed
+// and names are fixed).
+var portfolioFamilyVariants = map[string][]string{
+	"F1Parse":      {"money6", "int19", "big40", "expform"},
+	"F2Aggregate":  {"mixed1000"},
+	"F3MoneyLoop":  {"price-qty-round-fee"},
+	"F4Format":     {"plain", "fixed2dp", "scientific"},
+	"F5MapKey":     {"string1024", "hasher1024"},
+	"F6TightArith": {"add19", "mul19", "mulsmall", "div2dp", "divby4", "cmp19"},
+	"F7JSON":       {"plain", "quoted"},
+	"F8Database":   {"valuer-scan", "sqldecimal-compose", "null-roundtrip"},
+}
+
+func randDigits(r *rand.Rand, n int) string {
+	var sb strings.Builder
+	sb.Grow(n)
+	for range n {
+		sb.WriteByte(byte('0' + r.Intn(10)))
+	}
+	return sb.String()
+}
+
+func randNonzeroDigits(r *rand.Rand, n int) string {
+	return strconv.Itoa(1+r.Intn(9)) + randDigits(r, n-1)
+}
+
+// f1ParseInputs returns the F1 parse corpus per variant.
+func f1ParseInputs() map[string][]string {
+	r := newPortfolioRNG()
+	out := map[string][]string{}
+	for range 256 {
+		major := randNonzeroDigits(r, 4)
+		minor := randDigits(r, 2)
+		out["money6"] = append(out["money6"], major+"."+minor)
+		out["int19"] = append(out["int19"], randNonzeroDigits(r, 19))
+		out["big40"] = append(out["big40"], randNonzeroDigits(r, 1)+"."+randDigits(r, 39))
+		out["expform"] = append(out["expform"], "1."+randDigits(r, 4)+"E+"+strconv.Itoa(r.Intn(9)+1))
+	}
+	return out
+}
+
+var portfolioF1Inputs = f1ParseInputs()
+
+// f2AggregateInputs returns 1000 mixed-scale exact-add operands.
+func f2AggregateInputs() []string {
+	r := newPortfolioRNG()
+	out := make([]string, 0, 1000)
+	for range 1000 {
+		scale := r.Intn(4)
+		var sb strings.Builder
+		sb.WriteString(strings.TrimLeft(randDigits(r, 1+r.Intn(6)), "0"))
+		if scale > 0 {
+			sb.WriteByte('.')
+			sb.WriteString(randDigits(r, scale))
+		}
+		if sb.Len() == 0 || sb.String() == "." {
+			sb.Reset()
+			sb.WriteByte('0')
+		}
+		out = append(out, sb.String())
+	}
+	return out
+}
+
+var portfolioF2Inputs = f2AggregateInputs()
+
+// f3MoneyLoopInputs follows the MoneyLoop shape: 256 prices with
+// integer quantities 1..50. Three or four fractional price digits keep the
+// half-up cent round active; the first six pin clean/sticky ties and neighbors.
+func f3MoneyLoopInputs() (prices, qtys []string) {
+	prices = []string{"0.005", "0.015", "0.0050", "0.0051", "0.004", "0.006"}
+	qtys = []string{"1", "1", "1", "1", "1", "1"}
+	r := newPortfolioRNG()
+	for range 256 - len(prices) {
+		prices = append(prices, randNonzeroDigits(r, 1+r.Intn(3))+"."+randDigits(r, 3+r.Intn(2)))
+		qtys = append(qtys, strconv.Itoa(1+r.Intn(50)))
+	}
+	return prices, qtys
+}
+
+// f4FormatInputs returns pre-parsed values per F4 variant.
+func f4FormatInputs() map[string][]string {
+	r := newPortfolioRNG()
+	out := map[string][]string{}
+	fixedSuffixes := [...]string{".00", ".12", ".123", ".126", ".125", ".135", ".999", ".995"}
+	for i := range 256 {
+		out["plain"] = append(out["plain"], randDigits(r, 1+r.Intn(9)))
+		fixed := randDigits(r, 1+r.Intn(5)) + fixedSuffixes[i%len(fixedSuffixes)]
+		if i%16 >= 8 {
+			fixed = "-" + fixed
+		}
+		out["fixed2dp"] = append(out["fixed2dp"], fixed)
+		out["scientific"] = append(out["scientific"], randDigits(r, 1)+"."+randDigits(r, 6)+"E-"+strconv.Itoa(r.Intn(6)))
+	}
+	return out
+}
+
+var portfolioF4Inputs = f4FormatInputs()
+
+func TestF4FixedCorpusRoundingShapes(t *testing.T) {
+	inputs := f4FormatInputs()["fixed2dp"]
+	if len(inputs) != 256 {
+		t.Fatalf("fixed2dp corpus has %d inputs, want 256", len(inputs))
+	}
+	for _, negative := range []bool{false, true} {
+		for _, suffix := range []string{".00", ".12", ".123", ".126", ".125", ".135", ".999", ".995"} {
+			count := 0
+			for _, input := range inputs {
+				if strings.HasPrefix(input, "-") == negative && strings.HasSuffix(input, suffix) {
+					count++
+				}
+			}
+			if count != 16 {
+				t.Errorf("fixed2dp negative=%t suffix=%q has %d inputs, want 16", negative, suffix, count)
+			}
+		}
+	}
+}
+
+// f5MapKeyInputs returns distinct numeric keys plus alternate same-value
+// cohorts. The permutation and fractional digits come from the fixed seed.
+type f5KeyInput struct {
+	base   string
+	cohort string
+}
+
+func f5MapKeyInputs() []f5KeyInput {
+	r := newPortfolioRNG()
+	out := make([]f5KeyInput, 0, 1024)
+	for _, index := range r.Perm(1024) {
+		base := strconv.Itoa(1000+index) + "." + randDigits(r, 2)
+		out = append(out, f5KeyInput{base: base, cohort: base + "0"})
+	}
+	return out
+}
+
+var portfolioF5Inputs = f5MapKeyInputs()
+
+// f6TightInputs returns operand pairs per F6 variant.
+func f6TightInputs() map[string][2]string { return f6TightInputsFrom(newPortfolioRNG()) }
+
+func f6TightInputsFrom(r *rand.Rand) map[string][2]string {
+	pair := func() [2]string {
+		return [2]string{randNonzeroDigits(r, 19), randNonzeroDigits(r, 19)}
+	}
+	return map[string][2]string{
+		"add19": pair(), "mul19": pair(), "mulsmall": {randNonzeroDigits(r, 19), strconv.Itoa(1 + r.Intn(9))},
+		"div2dp": pair(), "divby4": {randNonzeroDigits(r, 19), strconv.Itoa(4)}, "cmp19": pair(),
+	}
+}
+
+var portfolioF6Inputs = f6TightInputs()
+
+// f7JSONValues returns the F7 JSON corpus per variant: valid JSON number
+// tokens (no leading integer zeros) with two fractional digits, bare or quoted.
+func f7JSONValues() map[string][]string {
+	r := newPortfolioRNG()
+	out := map[string][]string{}
+	for range 256 {
+		v := strconv.Itoa(r.Intn(1_000_000)) + "." + randDigits(r, 2)
+		out["plain"] = append(out["plain"], v)
+		out["quoted"] = append(out["quoted"], `"`+v+`"`)
+	}
+	return out
+}
+
+// TestPortfolioInputs checks the portfolio's own machinery: inputs are
+// deterministic from the committed seed and have the documented shapes, and
+// no variant name collides with go test's GOMAXPROCS suffix.
+func TestPortfolioInputs(t *testing.T) {
+	t.Run("deterministic inputs from the committed seed", func(t *testing.T) {
+		first, second := f1ParseInputs(), f1ParseInputs()
+		if !reflect.DeepEqual(first, second) || !reflect.DeepEqual(first, portfolioF1Inputs) {
+			t.Fatal("F1 generator not deterministic across its full corpus")
+		}
+		for _, s := range first["money6"] {
+			if len(s) != 7 || s[4] != '.' || s[0] == '0' {
+				t.Fatalf("money6 shape = %q, want four integer and two fractional digits", s)
+			}
+		}
+		for _, s := range first["int19"] {
+			if len(s) != 19 || s[0] == '0' {
+				t.Fatalf("int19 shape = %q, want 19 significant digits", s)
+			}
+		}
+		for _, s := range first["big40"] {
+			if len(s) != 41 || s[1] != '.' || s[0] == '0' {
+				t.Fatalf("big40 shape = %q, want 40 significant digits", s)
+			}
+		}
+		if firstF4, secondF4 := f4FormatInputs(), f4FormatInputs(); !reflect.DeepEqual(firstF4, secondF4) || !reflect.DeepEqual(firstF4, portfolioF4Inputs) {
+			t.Fatal("F4 generator not deterministic across its full corpus")
+		}
+		if firstF5, secondF5 := f5MapKeyInputs(), f5MapKeyInputs(); !reflect.DeepEqual(firstF5, secondF5) || !reflect.DeepEqual(firstF5, portfolioF5Inputs) || len(firstF5) != 1024 {
+			t.Fatal("F5 generator not deterministic or not 1024 entries")
+		}
+		seenF5 := make(map[string]bool, len(portfolioF5Inputs))
+		for _, pair := range portfolioF5Inputs {
+			if len(pair.base) != 7 || pair.base[4] != '.' || pair.base[0] == '0' || seenF5[pair.base] || pair.cohort != pair.base+"0" {
+				t.Fatalf("F5 duplicate or broken cohort pair: %+v", pair)
+			}
+			seenF5[pair.base] = true
+		}
+		a, b := f2AggregateInputs(), f2AggregateInputs()
+		if len(a) != 1000 || len(portfolioF2Inputs) != 1000 || !reflect.DeepEqual(a, portfolioF2Inputs) {
+			t.Fatal("F2 generator differs from init-time corpus")
+		}
+		for i := range a {
+			if a[i] != b[i] {
+				t.Fatalf("F2 generator not deterministic at %d: %q vs %q", i, a[i], b[i])
+			}
+		}
+		firstF6, secondF6 := f6TightInputs(), f6TightInputs()
+		if !reflect.DeepEqual(firstF6, secondF6) || !reflect.DeepEqual(firstF6, portfolioF6Inputs) {
+			t.Fatal("F6 generator not deterministic")
+		}
+		for variant, pair := range firstF6 {
+			if len(pair[0]) != 19 || pair[0][0] == '0' {
+				t.Fatalf("F6 %s first operand %q is not 19 significant digits", variant, pair[0])
+			}
+			if variant != "mulsmall" && variant != "divby4" && (len(pair[1]) != 19 || pair[1][0] == '0') {
+				t.Fatalf("F6 %s second operand %q is not 19 significant digits", variant, pair[1])
+			}
+		}
+		for seed := range int64(32) {
+			for variant, pair := range f6TightInputsFrom(rand.New(rand.NewSource(seed))) {
+				if len(pair[0]) != 19 || pair[0][0] == '0' {
+					t.Fatalf("F6 seed %d %s first operand %q is not 19 significant digits", seed, variant, pair[0])
+				}
+				if variant != "mulsmall" && variant != "divby4" && (len(pair[1]) != 19 || pair[1][0] == '0') {
+					t.Fatalf("F6 seed %d %s second operand %q is not 19 significant digits", seed, variant, pair[1])
+				}
+			}
+		}
+	})
+	t.Run("variant names", func(t *testing.T) {
+		for family, variants := range portfolioFamilyVariants {
+			for _, v := range variants {
+				if procSuffixName.MatchString(v) {
+					t.Errorf("family %s variant %q ends in -<digits>, which go test reads as a GOMAXPROCS suffix", family, v)
+				}
+			}
+		}
+	})
+}
+
+// sink variables keep timed loops from being optimized away.
+var (
+	sinkString string
+	sinkInt    int
+)
+
+// benchmarkFunctions lists the Benchmark functions declared in this
+// package's source files.
+func benchmarkFunctions(t *testing.T) map[string]*ast.FuncDecl {
+	t.Helper()
+	files, err := filepath.Glob("*_test.go")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("listing benchmark sources: %v", err)
+	}
+	out := map[string]*ast.FuncDecl{}
+	fset := token.NewFileSet()
+	for _, name := range files {
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, decl := range file.Decls {
+			if fn, ok := decl.(*ast.FuncDecl); ok && fn.Recv == nil && strings.HasPrefix(fn.Name.Name, "Benchmark") {
+				out[fn.Name.Name] = fn
+			}
+		}
+	}
+	return out
+}
+
+// TestPortfolioFamiliesAreF1ToF8 checks that the family table is exactly
+// F1–F8 and that no benchmark runs in parallel.
+func TestPortfolioFamiliesAreF1ToF8(t *testing.T) {
+	for family := range portfolioFamilyVariants {
+		if !regexp.MustCompile(`^F[1-8][A-Za-z]+$`).MatchString(family) {
+			t.Errorf("family %q is outside F1–F8", family)
+		}
+	}
+	for name, fn := range benchmarkFunctions(t) {
+		ast.Inspect(fn, func(n ast.Node) bool {
+			if sel, ok := n.(*ast.SelectorExpr); ok && (sel.Sel.Name == "RunParallel" || sel.Sel.Name == "SetParallelism") {
+				t.Errorf("%s calls %s: a concurrent throughput family needs a documented workload and contention measurements", name, sel.Sel.Name)
+			}
+			return true
+		})
+	}
+	sources, err := filepath.Glob("../*_test.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	concurrent := 0
+	for _, name := range sources {
+		src, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		concurrent += len(regexp.MustCompile(`(?m)^func Test\w*Concurrent\w*\(t \*testing\.T\)`).FindAll(src, -1))
+	}
+	if concurrent < 5 {
+		t.Fatalf("found %d concurrent correctness tests in the library package, want the pure-Go concurrency suite", concurrent)
+	}
+}

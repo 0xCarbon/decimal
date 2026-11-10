@@ -1,0 +1,6 @@
+go test fuzz v1
+byte('\x01')
+string("NaN")
+int64(0)
+uint64(0)
+int32(0)

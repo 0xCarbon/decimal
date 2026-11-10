@@ -1,0 +1,143 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package benchmarks
+
+import (
+	"fmt"
+	"math/big"
+	"strings"
+	"testing"
+
+	decimal "github.com/0xCarbon/decimal"
+)
+
+func TestF4IndependentRoundingOracle(t *testing.T) {
+	t.Run("fixed2dp", func(t *testing.T) {
+		for _, tc := range []struct{ input, want string }{
+			{"1.005", "1.00"},
+			{"1.015", "1.02"},
+			{"-1.005", "-1.00"},
+			{"-1.015", "-1.02"},
+			{"9.995", "10.00"},
+			{"0.004", "0.00"},
+			{"-0.004", "0.00"},
+		} {
+			got := f4ExpectedFixed2dp(tc.input)
+			if got != tc.want {
+				t.Errorf("fixed2dp(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		}
+	})
+	t.Run("scientific3", func(t *testing.T) {
+		for _, tc := range []struct{ input, want string }{
+			{"1234.5", "1.23E+3"},
+			{"9.995", "1.00E+1"},
+			{"-9.995", "-1.00E+1"},
+			{"1.245", "1.24E+0"},
+			{"0.00012345", "1.23E-4"},
+			{"0", "0.00E+0"},
+			{"-0", "0.00E+0"},
+		} {
+			got := f4ExpectedScientific3(tc.input)
+			if got != tc.want {
+				t.Errorf("scientific3(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		}
+	})
+}
+
+func TestF4PortfolioUsesPublicDisplay(t *testing.T) {
+	for _, tc := range []struct {
+		variant, input, want string
+	}{
+		{"fixed2dp", "1.005", f4ExpectedFixed2dp("1.005")},
+		{"scientific", "9.995", f4ExpectedScientific3("9.995")},
+	} {
+		value, err := decimal.Parse(tc.input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := f4FormatValue(tc.variant, value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != tc.want {
+			t.Errorf("F4 %s(%q) = %q, want %q", tc.variant, tc.input, got, tc.want)
+		}
+	}
+}
+
+func f4FormatValue(variant string, value decimal.Decimal) (string, error) {
+	switch variant {
+	case "fixed2dp":
+		return value.Fixed(2)
+	case "scientific":
+		return value.Scientific(3)
+	default:
+		panic("unknown F4 display variant: " + variant)
+	}
+}
+
+// f4RoundPositiveRatToInt rounds a nonnegative rational to an integer with
+// ties to even. It uses integer quotient/remainder, independently of Decimal.
+func f4RoundPositiveRatToInt(value *big.Rat) *big.Int {
+	quotient, remainder := new(big.Int), new(big.Int)
+	quotient.QuoRem(value.Num(), value.Denom(), remainder)
+	comparison := new(big.Int).Lsh(remainder, 1).Cmp(value.Denom())
+	if comparison > 0 || (comparison == 0 && quotient.Bit(0) == 1) {
+		quotient.Add(quotient, big.NewInt(1))
+	}
+	return quotient
+}
+
+func f4ExpectedFixed2dp(input string) string {
+	value, ok := new(big.Rat).SetString(input)
+	if !ok {
+		panic("invalid F4 fixed input: " + input)
+	}
+	negative := value.Sign() < 0
+	value.Abs(value)
+	value.Mul(value, big.NewRat(100, 1))
+	cents := f4RoundPositiveRatToInt(value)
+	digits := cents.String()
+	if len(digits) < 3 {
+		digits = strings.Repeat("0", 3-len(digits)) + digits
+	}
+	if negative && cents.Sign() != 0 {
+		return "-" + digits[:len(digits)-2] + "." + digits[len(digits)-2:]
+	}
+	return digits[:len(digits)-2] + "." + digits[len(digits)-2:]
+}
+
+func f4ExpectedScientific3(input string) string {
+	value, ok := new(big.Rat).SetString(input)
+	if !ok {
+		panic("invalid F4 scientific input: " + input)
+	}
+	if value.Sign() == 0 {
+		return "0.00E+0"
+	}
+	negative := value.Sign() < 0
+	value.Abs(value)
+	one, ten := big.NewRat(1, 1), big.NewRat(10, 1)
+	exponent := 0
+	for value.Cmp(ten) >= 0 {
+		value.Quo(value, ten)
+		exponent++
+	}
+	for value.Cmp(one) < 0 {
+		value.Mul(value, ten)
+		exponent--
+	}
+	value.Mul(value, big.NewRat(100, 1))
+	digits := f4RoundPositiveRatToInt(value)
+	if digits.Cmp(big.NewInt(1000)) == 0 {
+		digits.SetInt64(100)
+		exponent++
+	}
+	body := digits.String()
+	if negative {
+		return fmt.Sprintf("-%s.%sE%+d", body[:1], body[1:], exponent)
+	}
+	return fmt.Sprintf("%s.%sE%+d", body[:1], body[1:], exponent)
+}

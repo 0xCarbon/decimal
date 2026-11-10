@@ -1,0 +1,11 @@
+-- decTest converter samples (original constructions).
+-- Hand-written to test tools/dectestconv; NOT copied from the
+-- speleotrove distribution (the corpus is downloaded, never committed).
+-- The syntax follows the documented decTest grammar (speleotrove.com/decimal,
+-- General Decimal Arithmetic Testcases), which is cited for format only.
+precision: 9
+rounding: half_even
+dec012a001 add '1.25' '2.50' -> '3.75'
+dec012a002 subtract '1.00' '1.000' -> '0.000'
+rounding: half_up
+dec012a003 quantize '2.5' '1' -> '3' Inexact,Rounded
