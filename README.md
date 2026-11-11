@@ -192,7 +192,7 @@ The benchmark portfolio (families F1–F8: parsing, aggregation, a money
 loop, formatting, map keys, tight 19-digit arithmetic, JSON and
 `database/sql`) runs the same workloads through `decimal` and four other
 Go decimal libraries (the incumbents): [shopspring/decimal](https://github.com/shopspring/decimal)
-v1.4.0, [cockroachdb/apd](https://github.com/cockroachdb/apd) v3.2.3,
+v1.6.0, [cockroachdb/apd](https://github.com/cockroachdb/apd) v3.2.3,
 [ericlagergren/decimal](https://github.com/ericlagergren/decimal) and
 [govalues/decimal](https://github.com/govalues/decimal) v0.1.36. Every row
 first checks its results against a `math/big` oracle; a library that
@@ -201,41 +201,42 @@ row rather than timed.
 
 The table gives medians of 10 interleaved rounds (AMD Ryzen 9 5900XT, two
 pinned cores of a shared host, Go 1.27.1 linux/amd64, built with
-`GOEXPERIMENT=simd`, 2026-11-10). Speedup is the fastest incumbent's time divided by
-`decimal`'s time, using the medians shown (above 1.00x is faster).
+`GOEXPERIMENT=simd`, 2026-11-11). Speedup is the fastest incumbent's time
+divided by `decimal`'s time, using the medians shown (above 1.00x is
+faster).
 
 | family | workload | fastest incumbent | `decimal` time | incumbent time | speedup |
 | --- | --- | --- | ---: | ---: | ---: |
-| F1 parse | `"1234.56"` | govalues | 10.9 ns | 21.0 ns | 1.93x |
-|  | 19-digit integer | govalues | 12.7 ns | 48.2 ns | 3.80x |
-|  | 40 digits | shopspring | 58.9 ns | 321 ns | 5.45x |
-|  | exponent form | ericlagergren | 12.3 ns | 56.5 ns | 4.59x |
-| F2 aggregate | 1000 exact mixed-scale additions | govalues | 4.60 µs | 7.70 µs | 1.67x |
-| F3 money loop | price × qty, round to cents, fee (256 lines) | ericlagergren | 3.27 µs | 12.8 µs | 3.91x |
-| F4 format | plain | govalues | 18.3 ns | 19.1 ns | 1.04x |
-|  | fixed, 2 places | govalues | 24.8 ns | 23.4 ns | 0.94x |
-|  | scientific | apd | 27.6 ns | 125 ns | 4.53x |
-| F5 map key | 1024 string keys | govalues | 116 µs | 133 µs | 1.15x |
-| F6 tight arithmetic | add, 19 digits | ericlagergren | 4.60 ns | 20.8 ns | 4.52x |
-|  | multiply, 19 digits | ericlagergren | 3.95 ns | 22.0 ns | 5.57x |
-|  | divide to 2 places | shopspring | 13.1 ns | 229 ns | 17.48x |
-|  | divide by 4 | apd | 12.5 ns | 170 ns | 13.60x |
-|  | compare | shopspring | 2.70 ns | 6.05 ns | 2.24x |
-| F7 JSON | encode + decode, bare number | govalues | 43.3 ns | 49.5 ns | 1.14x |
-|  | encode + decode, quoted number | govalues | 39.6 ns | 49.8 ns | 1.26x |
-| F8 `database/sql` | Valuer + Scan | govalues | 720 ns | 733 ns | 1.02x |
-|  | `SQLDecimal` compose | apd | 583 ns | 601 ns | 1.03x |
-|  | `NullDecimal` round trip | govalues | 706 ns | 703 ns | 1.00x |
+| F1 parse | `"1234.56"` | govalues | 11.4 ns | 22.7 ns | 1.99x |
+|  | 19-digit integer | govalues | 13.1 ns | 53.0 ns | 4.06x |
+|  | 40 digits | shopspring | 61.8 ns | 342 ns | 5.54x |
+|  | exponent form | shopspring | 12.7 ns | 60.5 ns | 4.75x |
+| F2 aggregate | 1000 exact mixed-scale additions | govalues | 4.78 µs | 8.11 µs | 1.69x |
+| F3 money loop | price × qty, round to cents, fee (256 lines) | ericlagergren | 3.51 µs | 13.1 µs | 3.74x |
+| F4 format | plain | govalues | 17.9 ns | 19.5 ns | 1.09x |
+|  | fixed, 2 places | govalues | 24.5 ns | 24.6 ns | 1.00x |
+|  | scientific | apd | 27.3 ns | 121 ns | 4.44x |
+| F5 map key | 1024 string keys | govalues | 118 µs | 147 µs | 1.25x |
+| F6 tight arithmetic | add, 19 digits | ericlagergren | 4.52 ns | 21.2 ns | 4.69x |
+|  | multiply, 19 digits | ericlagergren | 3.66 ns | 22.3 ns | 6.07x |
+|  | divide to 2 places | shopspring | 13.9 ns | 153 ns | 11.05x |
+|  | divide by 4 | shopspring | 13.3 ns | 101 ns | 7.58x |
+|  | compare | shopspring | 2.78 ns | 5.58 ns | 2.01x |
+| F7 JSON | encode + decode, bare number | govalues | 43.9 ns | 52.1 ns | 1.19x |
+|  | encode + decode, quoted number | govalues | 39.7 ns | 52.0 ns | 1.31x |
+| F8 `database/sql` | Valuer + Scan | govalues | 752 ns | 753 ns | 1.00x |
+|  | `SQLDecimal` compose | apd | 585 ns | 618 ns | 1.06x |
+|  | `NullDecimal` round trip | govalues | 718 ns | 716 ns | 1.00x |
 
-The speedups of F1 to F3, F4 scientific and F5 to F7 are significant
-(Mann–Whitney, p < 0.001), and in those rows `decimal` allocates no more
-than the best incumbent, usually nothing. In F4 plain and in F8 the
-samples of `decimal` and of the fastest incumbent overlap: treat those rows
-as ties. In F4 fixed, govalues is faster by the margin shown. F8 is the one
-family where `decimal` uses more memory:
-a `Decimal` is 32 bytes, so the `driver.Value` round trip and the
-value-shaped `SQLDecimal`/`NullDecimal` wrappers move 32–48 more bytes per
-row (and one more allocation in compose), which the database round trip
+The speedups of F1 to F3, F4 plain and scientific, and F5 to F7 are
+significant (Mann–Whitney, p < 0.001), and in those rows `decimal`
+allocates no more than the best incumbent, usually nothing. In F4 fixed and
+in the F8 Valuer + Scan and `NullDecimal` rows the samples of `decimal` and
+of the fastest incumbent overlap: treat those rows as ties. F8 is the one
+family where `decimal` uses more memory: a `Decimal` is 32 bytes, so the
+`driver.Value` round trip and the value-shaped `SQLDecimal`/`NullDecimal`
+wrappers move 28–48 more bytes per row (and one more allocation in
+compose, where the time is 6% shorter), which the database round trip
 itself dwarfs.
 
 To reproduce:
