@@ -5,7 +5,7 @@ four other Go decimal libraries in the same test binary:
 
 | Library | Version |
 | --- | --- |
-| [github.com/shopspring/decimal](https://github.com/shopspring/decimal) | v1.4.0 |
+| [github.com/shopspring/decimal](https://github.com/shopspring/decimal) | v1.6.0 |
 | [github.com/cockroachdb/apd/v3](https://github.com/cockroachdb/apd) | v3.2.3 |
 | [github.com/ericlagergren/decimal](https://github.com/ericlagergren/decimal) | v0.0.0-20240411145413-00de7ca16731 |
 | [github.com/govalues/decimal](https://github.com/govalues/decimal) | v0.1.36 |
